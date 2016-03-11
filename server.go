@@ -15,8 +15,11 @@ import (
     "os"
 )
 
+//varianbles holdig a reference to DB and Srv Process.
 var tiedotProcess *exec.Cmd;
+var caddyProcess *exec.Cmd;
 
+//concurrent set of collection names (one per hostname)
 var collections = struct{
     sync.RWMutex
     data map[string]bool
@@ -25,14 +28,20 @@ var collections = struct{
 func server(addr string) {
     
     dbAddr := "localhost:7778";    
-    setupSignals(dbAddr);
+    caddyAddr := "localhost:7778";
+    serverAddr := addr;
+        
+    setupSignals(dbAddr, caddyAddr);
     setupTiedotDB(dbAddr);
+    setupCaddy(caddyAddr);
+    
     go scheduledCleaner();
     
-	var listener, err = net.Listen("tcp", addr);      
+    //listen for incomming logs    
+	var listener, err = net.Listen("tcp", serverAddr);      
 	checkError(err)
     
-    log.Println("Server listening on " + addr);
+    log.Println("Server listening on " + serverAddr);
 
 	for {
 		var conn, err = listener.Accept()
@@ -62,8 +71,22 @@ func cleanDB(){
     log.Println("Running scheduled cleanning.");
 }
 
+func setupCaddy(addr string){
+    runCaddy(addr);
+}
+
+func runCaddy(addr string){
+    runProcess("caddy", &caddyProcess);
+}
+
+func runTiedotDB(dbAddr string){
+    runProcess("tiedot", &tiedotProcess, "-mode=httpd", "-dir=/tmp/locagodb", "-port=7778", "-bind=0.0.0.0", "-verbose");
+}
+
 func setupTiedotDB(dbAddr string){
-    runTiedotDB(dbAddr);  
+    //run the server
+    runTiedotDB(dbAddr);
+    //query the collection names
     var res *goreq.Response;
     var err error;
     
@@ -83,34 +106,49 @@ func setupTiedotDB(dbAddr string){
     }
        
     log.Printf("Existing collections %v\n", collections.data);  
-    
 }
 
-func runTiedotDB(dbAddr string){    
-    tiedotProcess = exec.Command("tiedot", "-mode=httpd", "-dir=/tmp/locagodb", "-port=7778", "-bind=0.0.0.0", "-verbose")
-    tiedotProcess.Stdout = os.Stdout
-    tiedotProcess.Stderr = os.Stderr
-    tiedotProcess.Start();
+
+func runProcess(name string, process **exec.Cmd, arg ...string){
+    (*process) = exec.Command(name, arg...);
+    (*process).Stdout = os.Stdout;
+    (*process).Stderr = os.Stderr;
+    (*process).Start();
 }
 
-func setupSignals(dbAddr string){
+func setupSignals(dbAddr string, serverAddr string){
     sigs := make(chan os.Signal, 1)
     signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGCHLD)
     
-    go func() {
-        for{
-            var sig = <-sigs;
+    go func() {        
+        for sig := range sigs{
+            
+            var wstatus syscall.WaitStatus;            
+            var pid, _ = syscall.Wait4(-1, &wstatus, syscall.WNOHANG, nil);
+            
             switch sig {
-            case syscall.SIGCHLD:
-                log.Println("Restarting DB process.");
-                tiedotProcess.Wait();
-                runTiedotDB(dbAddr);
-            default:
-                log.Println("Closing DB process.");
-                goreq.Request{ Uri: "http://"+dbAddr+"/shutdown" }.Do();
-                tiedotProcess.Wait()
-                log.Println("Bye.")
-                os.Exit(0);            
+                case syscall.SIGCHLD:
+                    if pid == tiedotProcess.Process.Pid{
+                        log.Println("Restarting Tidot DB.");
+                        tiedotProcess.Wait();
+                        runTiedotDB(dbAddr);
+                    }
+                    if pid == caddyProcess.Process.Pid{
+                        log.Println("Restarting Caddy Server.");
+                        caddyProcess.Wait();
+                        runCaddy(serverAddr);
+                    }       
+                    break;                             
+                default:
+                    log.Println("Closing Tidot DB.");
+                    goreq.Request{ Uri: "http://"+dbAddr+"/shutdown" }.Do();
+                    tiedotProcess.Wait()
+                    
+                    log.Println("Closing Caddy Server.");
+                    caddyProcess.Process.Kill();
+                    caddyProcess.Wait()
+                    log.Println("Bye.")
+                    os.Exit(0);            
             }
         }
     }()
